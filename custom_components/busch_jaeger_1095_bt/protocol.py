@@ -66,15 +66,66 @@ def input_write(index, value, destination=0x0201):
     return bytes.fromhex("11000400fff0") + struct.pack(">HB", destination, len(apdu) - 1) + apdu
 
 
-def setpoint_read(destination=0x0201):
-    """APK getDataPointValue(channel=1, output index=2, isInput=false).
+def output_read(index, destination=0x0201):
+    """APK getDataPointValue(channel=1, output index, isInput=false).
 
     TelegramFactory::getDataPointValue (0x509e22c) selects property DF,
     service 01, then appends the one-based channel and output index.
-    Output 2 is the effective setpoint for the supported function CF mapping.
     """
-    apdu = bytes.fromhex("02c700df000103000102")
+    if not 1 <= index <= 255:
+        raise ValueError("Output index must be between 1 and 255")
+    apdu = bytes.fromhex("02c700df0001030001") + bytes([index])
     return bytes.fromhex("11000400fff0") + struct.pack(">HB", destination, len(apdu) - 1) + apdu
+
+
+def setpoint_read(destination=0x0201):
+    """Output 2 is the effective setpoint for the supported function CF mapping."""
+    return output_read(2, destination)
+
+
+# Output datapoints of channel 1 (function CF), read with output_read().
+# Pairing IDs and semantics follow the ABB free@home local API reference for
+# room temperature controllers. Indices 1-5 and 9 were checked on hardware by
+# changing setpoint, Eco and on/off at the device; 6, 7, 8, 10 and 11 answer
+# but never changed and stay undecoded. Indices above 11 do not answer.
+OUTPUTS = {
+    1: ("actuating_value_heating", "percent", 0x0030),
+    2: ("setpoint", "temperature", 0x0033),
+    3: ("relative_setpoint", "temperature", 0x0034),
+    4: ("controller_on", "bool", 0x0038),
+    5: ("status", "status", 0x0036),
+    9: ("measured_temperature", "temperature", 0x0130),
+}
+
+# AL_STATE_INDICATION (0x0036) bitmask, ABB free@home local API reference.
+STATUS_BITS = {
+    0x01: "comfort",
+    0x02: "standby",
+    0x04: "eco",
+    0x08: "building_protection",
+    0x10: "dew_alarm",
+    0x20: "heating_mode",  # set = heating, unset = cooling
+    0x40: "inactive",  # set = currently neither heating nor cooling
+    0x80: "frost_alarm",
+}
+
+
+def decode_status(raw):
+    """Return the named flags of a status indication byte."""
+    return {name: bool(raw & bit) for bit, name in STATUS_BITS.items()}
+
+
+def decode_value(kind, value):
+    """Decode a datapoint value by kind; None if the payload does not fit."""
+    if kind == "temperature" and len(value) == 2:
+        return round(knx_float(value), 3)
+    if kind == "percent" and len(value) == 1:
+        return round(value[0] * 100 / 255, 1)
+    if kind == "bool" and len(value) == 1:
+        return bool(value[0] & 1)
+    if kind == "status" and len(value) == 1:
+        return value[0]
+    return None
 
 
 def knx_float(data):
@@ -116,7 +167,29 @@ def function_reply(plaintext):
     }
 
 
-def state_reports(plaintext):
+# Group addresses are assigned per free@home installation. These defaults
+# belong to the installation the protocol was first validated with; pass
+# your own mapping to Thermostat(groups=...) or to state_reports().
+DEFAULT_GROUPS = {
+    0x704B: "measured_temperature",
+    0x6467: "setpoint",
+    0x3F71: "temperature_offset",
+    0x8FFD: "eco",
+}
+
+GROUP_KINDS = {
+    "measured_temperature": "temperature",
+    "setpoint": "temperature",
+    "temperature_offset": "temperature",
+    "relative_setpoint": "temperature",
+    "actuating_value_heating": "percent",
+    "controller_on": "bool",
+    "status": "status",
+}
+
+
+def group_telegrams(plaintext):
+    """Return every (group address, value bytes) pair of a group telegram."""
     # TelegramService extended header (bit 7) carries two optional bytes.
     # Then strip the 3-byte Bluetooth envelope, as native onPacketReceived does.
     if not plaintext or plaintext[0] & 3 != 3:
@@ -125,7 +198,7 @@ def state_reports(plaintext):
     frame = plaintext[offset:]
     if len(frame) < 11 or frame[0] not in (0x11, 0x29) or frame[1] != 0 or not frame[3] & 0x80:
         return []
-    reports = []
+    telegrams = []
     pos = 6
     while pos + 3 <= len(frame):
         address = int.from_bytes(frame[pos : pos + 2], "big")
@@ -135,20 +208,30 @@ def state_reports(plaintext):
             break
         apdu = frame[pos : pos + size]
         pos += size
-        value = apdu[2:]
-        if address in (0x704B, 0x6467, 0x3F71) and len(value) == 2:
-            name = {
-                0x704B: "measured_temperature",
-                0x6467: "setpoint",
-                0x3F71: "temperature_offset",
-            }[address]
+        telegrams.append((address, apdu[2:]))
+    return telegrams
+
+
+def state_reports(plaintext, groups=None):
+    """Decode group telegrams whose address is in groups (default DEFAULT_GROUPS)."""
+    groups = DEFAULT_GROUPS if groups is None else groups
+    reports = []
+    for address, value in group_telegrams(plaintext):
+        name = groups.get(address)
+        if name == "eco" and len(value) == 1:
+            # The eco group carries the status indication byte; bit 2 is Eco.
             reports.append(
-                {"name": name, "value": round(knx_float(value), 3), "group": f"{address:04x}"}
+                {
+                    "name": "eco",
+                    "value": bool(value[0] & 4),
+                    "raw": value[0],
+                    "group": f"{address:04x}",
+                }
             )
-        elif address == 0x8FFD and len(value) == 1:
-            reports.append(
-                {"name": "eco", "value": bool(value[0] & 4), "raw": value[0], "group": "8ffd"}
-            )
+            continue
+        decoded = decode_value(GROUP_KINDS.get(name), value) if name else None
+        if decoded is not None:
+            reports.append({"name": name, "value": decoded, "group": f"{address:04x}"})
     return reports
 
 
@@ -172,11 +255,19 @@ class Thermostat:
     """
 
     def __init__(
-        self, address, secret, destination=0x0201, on_event=None, raw=False, connection_factory=None
+        self,
+        address,
+        secret,
+        destination=0x0201,
+        on_event=None,
+        raw=False,
+        connection_factory=None,
+        groups=None,
     ):
         if len(secret) != 32:
             raise ValueError("ACS secret must contain 32 bytes")
         self.address, self.secret, self.destination = address, bytes(secret), destination
+        self.groups = DEFAULT_GROUPS if groups is None else dict(groups)
         self.on_event, self.raw = on_event, raw
         self._connection_factory = connection_factory
         self.state = {}
@@ -382,9 +473,12 @@ class Thermostat:
                     reply["datapoint_index"],
                 ) == key and not future.done():
                     future.set_result(reply)
-        for report in state_reports(normalized):
+        for report in state_reports(normalized, self.groups):
             self.state[report["name"]] = report["value"]
             self._emit("state", **report)
+        for address, value in group_telegrams(normalized):
+            if address not in self.groups:
+                self._emit("group_report", group=f"{address:04x}", hex=value.hex())
 
     async def _receive_loop(self):
         try:
@@ -457,21 +551,31 @@ class Thermostat:
             input_write(index, value, self.destination), index, "0xda", "0x81"
         )
 
-    async def read_setpoint(self):
-        """Read the actual effective target without writing temperature or mode."""
+    async def read_output_raw(self, index):
+        """Read one output datapoint of channel 1 and return its value bytes."""
         async with self._lock:
             reply = await self._request(
-                setpoint_read(self.destination), 2, "0xdf", "0x01", reject_errors=False
+                output_read(index, self.destination), index, "0xdf", "0x01", reject_errors=False
             )
-            if reply["result_code"] & 128:
-                raise ReadbackError(f"Setpoint read rejected: {reply['result_name']}")
-            value = bytes.fromhex(reply["value"])
-            if len(value) != 2:
-                raise ReadbackError("Setpoint read returned an invalid temperature payload")
-            temperature = round(knx_float(value), 3)
-            self.state["setpoint"] = temperature
-            self._emit("state", name="setpoint", value=temperature, source="readback")
-            return temperature
+        if reply["result_code"] & 128:
+            raise ReadbackError(f"Output {index} read rejected: {reply['result_name']}")
+        return bytes.fromhex(reply["value"])
+
+    async def read_output(self, index):
+        """Read and decode a known output (see OUTPUTS); updates state."""
+        if index not in OUTPUTS:
+            raise ValueError(f"Output {index} has no known decoding; use read_output_raw")
+        name, kind, _pairing = OUTPUTS[index]
+        value = decode_value(kind, await self.read_output_raw(index))
+        if value is None:
+            raise ReadbackError(f"Output {index} returned an invalid {kind} payload")
+        self.state[name] = value
+        self._emit("state", name=name, value=value, source="readback")
+        return value
+
+    async def read_setpoint(self):
+        """Read the actual effective target without writing temperature or mode."""
+        return await self.read_output(2)
 
     async def set_temperature(self, celsius):
         """Set absolute Celsius temperature; hardware accepts 21 and 21.5.
@@ -496,6 +600,16 @@ class Thermostat:
         async with self._lock:
             operations = [(6, True), (5, True)] if enabled else [(5, False), (6, True)]
             return [await self._write_input(index, bytes([value])) for index, value in operations]
+
+    async def set_power(self, on):
+        """Switch the controller on (comfort/eco as before) or off (protection mode).
+
+        Input 6 is the controller on/off request (pairing 0x0042). Verified on
+        hardware: 0 drops the setpoint to frost protection and output 4 to 0;
+        1 restores the previous mode and setpoint.
+        """
+        async with self._lock:
+            return await self._write_input(6, b"\x01" if on else b"\x00")
 
     async def listen(self, seconds):
         deadline = asyncio.get_running_loop().time() + seconds

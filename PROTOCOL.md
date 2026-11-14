@@ -30,3 +30,32 @@ The coordinator waits 300 ms after the mode acknowledgements before reading to a
 ## Validation status
 
 The frame construction and reply handling are covered by simulated encrypted sessions, including repeated mode changes, a different effective Eco target, mismatched acknowledgements, malformed/rejected reads, and timeout handling. The new read transaction has **not yet been validated on the physical thermostat**. The request follows the reconstructed app path; the expected reply layout follows the app's reader and existing function-property replies. Synthetic responses are test fixtures, not recorded read transactions.
+
+# Output datapoints, on/off and group addresses
+
+Checked on a second 1095 UTA-BT installation by reading outputs while changing setpoint, Eco and on/off at the device.
+
+## Outputs of channel 1
+
+`output_read(index)` builds the same frame as the setpoint read with another output index. Indices 1–11 answer; 12 and above time out and leave the session unusable.
+
+| Output | Pairing ID (ABB local API) | Meaning | Payload |
+|---|---|---|---|
+| 1 | 0x0030 | actuating value heating | 1 byte, 0–255 = 0–100 % |
+| 2 | 0x0033 | effective setpoint (Eco setpoint while Eco is active, 7 °C when off) | KNX float16 |
+| 3 | 0x0034 | relative setpoint (user offset) | KNX float16 |
+| 4 | 0x0038 | controller on (1) / protection mode (0) | 1 byte |
+| 5 | 0x0036 | status indication | 1 byte bitmask |
+| 9 | 0x0130 | measured room temperature | KNX float16 |
+
+Outputs 6, 7, 8, 10 and 11 answer (`05`, 4 × `00`, `00`, `00`, `00000000ffffffff`) but never changed during the tests and are not decoded.
+
+Status bits (ABB local API, matches observed `21` comfort/heating, `61` comfort/no demand, `64` eco/no demand): `01` comfort, `02` standby, `04` eco, `08` building protection, `10` dew alarm, `20` heating (set) / cooling (unset), `40` no heating or cooling, `80` frost alarm.
+
+## On/off
+
+Input 6 is the controller on/off request (pairing 0x0042); `set_eco` already writes it as 1. Writing 0 switched the controller to protection mode (output 4 = 0, setpoint 7.0 °C, actuating value 0); writing 1 restored comfort mode and the previous setpoint. `Thermostat.set_power()` wraps this.
+
+## Group addresses are per installation
+
+The pushed group telegrams carry the same datapoints, but the addresses differ between installations. In the second installation: measured temperature `B94B` (about once per second), setpoint `4D57`, relative setpoint `AE28`, actuating value `E7EF`, status `AFC6`. The original `704B / 6467 / 3F71 / 8FFD` therefore only work for the first installation. `Thermostat(groups=...)` takes a per-installation map, and telegrams for unmapped addresses are emitted as `group_report` events. Reading the outputs needs no address map.
