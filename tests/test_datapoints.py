@@ -80,3 +80,34 @@ def test_read_output_rejects_unknown_index():
     device = bt.Thermostat("AA:BB", bytes(32))
     with pytest.raises(ValueError):
         asyncio.run(device.read_output(7))
+
+
+def test_heartbeat_and_unlock_frames():
+    assert bt.heartbeat_request().hex() == "11001c80fff000000502fd00020101"
+    frame = bt.serial_address_write(bytes.fromhex("00fc00112233"), 0x0201, 0x1234, 25)
+    assert frame.hex() == "11001080fff000000e03de00fc0011223302011234020519"
+    with pytest.raises(ValueError):
+        bt.serial_address_write(b"\x00", 0x0201, 0x1234, 25)
+
+
+def test_time_info_matches_device_echo():
+    import datetime as dt
+
+    now = dt.datetime(2026, 11, 15, 4, 15, 24, tzinfo=dt.UTC)
+    frame = bt.time_info(now, "Europe/Berlin", 51.4, 7.2).hex()
+    # Header, UTC date/time, current offset entry (+60 min).
+    assert frame.startswith("11000c00fff002013802fd0002040f0b07ea180f04000f0b07ea180f0400003c")
+    # 28.03.2027 01:00 UTC +120, 31.10.2027 01:00 UTC +60, 26.03.2028 01:00 UTC +120,
+    # then marker, longitude 7, latitude 51.
+    assert frame.endswith("1c0307eb0000010000781f0a07eb00000100003c1a0307ec00000100007801000733")
+
+
+def test_heartbeat_reply_is_collected():
+    device = bt.Thermostat("AA:BB", bytes(32))
+    device._collect = {}
+    # Three groups in one telegram: setpoint, offset, flags word.
+    plaintext = bytes.fromhex("83010200170011003ce002014d5703f0800c65ae2803f4800000120a03cc800022")
+    device._telegram(bytes.fromhex("03") + plaintext[3:])
+    assert device._collect[0x120A] == bytes.fromhex("0022")
+    assert int.from_bytes(device._collect[0x120A], "big") & bt.FLAG_FPC_UNLOCKED
+    assert device._collected.is_set()

@@ -59,3 +59,18 @@ Input 6 is the controller on/off request (pairing 0x0042); `set_eco` already wri
 ## Group addresses are per installation
 
 The pushed group telegrams carry the same datapoints, but the addresses differ between installations. In the second installation: measured temperature `B94B` (about once per second), setpoint `4D57`, relative setpoint `AE28`, actuating value `E7EF`, status `AFC6`. The original `704B / 6467 / 3F71 / 8FFD` therefore only work for the first installation. `Thermostat(groups=...)` takes a per-installation map, and telegrams for unmapped addresses are emitted as `group_report` events. Reading the outputs needs no address map.
+
+# Lock after a power cycle
+
+After a power cycle the 1095 UTA-BT still accepts the authenticated session, sends its group telegrams and answers RPC telegrams (APCI `2FD`), but ignores every function property command (`output_read`, `input_write`) until the free@home app has connected once. The regulation was also observed to misbehave in that state.
+
+The app's connect sequence (`FastDeviceConnector`), reproduced on hardware:
+
+1. `heartbeat_request()` — `rpcHeartbeatRequest` as standard broadcast. The reply is one group telegram with all output values. Works while locked.
+2. One of those groups is the device status word (`NotificationFlags`; group address is installation-specific, on the test device a 2-byte value on channel 3). Bit `0x0002` is `fpcServerUnlocked`: `0x0020` locked, `0x0022` unlocked.
+3. If locked: `serial_address_write(serial, address, domain, rf_channel)` — `IndividualAddressSerialNumber_Write` (APCI `3DE`) with the values the device already has. Serial, address and domain address are in the installation export (`device-<serial>.bdf`).
+4. `time_info(...)` — `rpcSetTimeInfo`: UTC time, current offset, next three daylight-saving changes, rounded location. The device confirms with APCI `2FE`.
+
+The APK builds the address write with message code `4C`. Sent that way over BLE the device only forwards the frame to the radio network (it echoes it with its own source address) and stays locked. As an `L_Data` standard broadcast (message code `11`, like the heartbeat) the device applies it and the flag changes to unlocked.
+
+`Thermostat.heartbeat()`, `unlock()` and `set_time()` wrap these telegrams.

@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as dt
 import hmac
 import math
 import os
 import struct
 import time
+from zoneinfo import ZoneInfo
 
 from bleak.exc import BleakError
 from cryptography.hazmat.primitives import cmac
@@ -81,6 +83,87 @@ def output_read(index, destination=0x0201):
 def setpoint_read(destination=0x0201):
     """Output 2 is the effective setpoint for the supported function CF mapping."""
     return output_read(2, destination)
+
+
+# NotificationFlags bit of the device status word (free@home Next: fpcServerUnlocked).
+# After a power cycle the bit is clear: the device accepts the session, RPC
+# telegrams and group traffic, but ignores every function property command
+# (output_read, input_write) until its address is written again by serial.
+FLAG_FPC_UNLOCKED = 0x0002
+
+
+def heartbeat_request(addresses=(0x0201,)):
+    """APK rpcHeartbeatRequest as standard broadcast (GEPDeviceConnector::readRuntimeData).
+
+    The device answers with one group telegram carrying all its output values,
+    including the status word with FLAG_FPC_UNLOCKED. Works while locked.
+    """
+    apdu = bytes.fromhex("02fd000201") + bytes(address & 0xFF for address in addresses)
+    return bytes.fromhex("11001c80fff00000") + bytes([len(apdu) - 1]) + apdu
+
+
+def serial_address_write(serial, address, domain, rf_channel):
+    """IndividualAddressSerialNumber_Write (APCI 3DE) with the values the device already has.
+
+    This is what FastDeviceConnector::unlockFpcServer sends. On hardware the
+    device only applies it as an L_Data broadcast (message code 11); with the
+    APK's message code 4C it merely forwards the frame to the radio network.
+    serial is the 6-byte device serial, domain the installation's domain address.
+    """
+    serial = bytes(serial)
+    if len(serial) != 6:
+        raise ValueError("Device serial must contain 6 bytes")
+    apdu = bytes.fromhex("03de") + serial + struct.pack(">HH", address, domain)
+    apdu += bytes([2, 5, rf_channel])
+    return bytes.fromhex("11001080fff00000") + bytes([len(apdu) - 1]) + apdu
+
+
+def _date_time(moment):
+    return struct.pack(">BBH", moment.day, moment.month, moment.year) + bytes(
+        [moment.second, moment.minute, moment.hour, 0]
+    )
+
+
+def _offset_minutes(moment, zone):
+    return int(moment.astimezone(zone).utcoffset().total_seconds() // 60)
+
+
+def _transitions(start, zone, count):
+    """Next UTC offset changes after start, to the minute."""
+    found, moment, offset = [], start, _offset_minutes(start, zone)
+    limit = start + dt.timedelta(days=366 * 3)
+    while len(found) < count and moment < limit:
+        following = moment + dt.timedelta(days=1)
+        if _offset_minutes(following, zone) != offset:
+            low, high = moment, following
+            while high - low > dt.timedelta(minutes=1):
+                middle = low + (high - low) / 2
+                if _offset_minutes(middle, zone) == offset:
+                    low = middle
+                else:
+                    high = middle
+            high = high.replace(second=0, microsecond=0)
+            offset = _offset_minutes(high, zone)
+            found.append((high, offset))
+        moment = following
+    return found
+
+
+def time_info(now, zone, latitude, longitude, destination=0x0201):
+    """APK rpcSetTimeInfo payload of BtTaskController::startWriteTimeInformation.
+
+    UTC date and time, the current UTC offset, the next three offset changes
+    and the location rounded to whole degrees. now must be timezone-aware.
+    """
+    if isinstance(zone, str):
+        zone = ZoneInfo(zone)
+    now = now.astimezone(dt.UTC).replace(microsecond=0)
+    payload = _date_time(now) + _date_time(now) + struct.pack(">h", _offset_minutes(now, zone))
+    for moment, offset in _transitions(now, zone, 3):
+        payload += _date_time(moment) + struct.pack(">h", offset)
+    payload += bytes([1]) + struct.pack(">hb", round(longitude), round(latitude))
+    apdu = bytes.fromhex("02fd000204") + payload
+    return bytes.fromhex("11000c00fff0") + struct.pack(">HB", destination, len(apdu) - 1) + apdu
 
 
 # Output datapoints of channel 1 (function CF), read with output_read().
@@ -281,6 +364,8 @@ class Thermostat:
         self._tx_counter = 0
         self._rx_counter = -1
         self._pending = None
+        self._collect = None
+        self._collected = asyncio.Event()
         self._lock = asyncio.Lock()
         self._failure = None
         self._shared = None
@@ -476,7 +561,12 @@ class Thermostat:
         for report in state_reports(normalized, self.groups):
             self.state[report["name"]] = report["value"]
             self._emit("state", **report)
-        for address, value in group_telegrams(normalized):
+        telegrams = group_telegrams(normalized)
+        if self._collect is not None:
+            self._collect.update(telegrams)
+            if len(telegrams) > 2:  # the heartbeat reply, not a single push
+                self._collected.set()
+        for address, value in telegrams:
             if address not in self.groups:
                 self._emit("group_report", group=f"{address:04x}", hex=value.hex())
 
@@ -550,6 +640,51 @@ class Thermostat:
         return await self._request(
             input_write(index, value, self.destination), index, "0xda", "0x81"
         )
+
+    async def send_telegram(self, frame):
+        """Send one telegram that has no matched reply (RPC, broadcast)."""
+        async with self._lock:
+            if not self._reader or self._failure:
+                raise ProtocolError(f"Connection is not usable: {self._failure}")
+            counter = self._tx_counter
+            self._tx_counter += 1
+            packet = encrypt_packet(
+                bytes.fromhex("03020000") + frame, self._shared, self._iv_suffix, counter
+            )
+            self._emit("telegram", counter=counter, frame=frame.hex())
+            try:
+                await self._send(packet, DATA_IN_UUID)
+            except BaseException:
+                self._failure = ProtocolError("Send failed; reconnect before another command")
+                raise
+
+    async def heartbeat(self, timeout=3.0):
+        """Ask for all output values; return {group address: value bytes}.
+
+        Works while the device is locked after a power cycle. Group addresses
+        are installation-specific; the caller maps them.
+        """
+        self._collect = {}
+        self._collected.clear()
+        try:
+            await self.send_telegram(heartbeat_request((self.destination,)))
+            try:
+                await asyncio.wait_for(self._collected.wait(), timeout)
+            except TimeoutError as exc:
+                raise ProtocolError("No heartbeat reply") from exc
+            return dict(self._collect)
+        finally:
+            self._collect = None
+
+    async def unlock(self, serial, domain, rf_channel, settle=1.0):
+        """Rewrite the device address by serial; clears the lock after a power cycle."""
+        await self.send_telegram(serial_address_write(serial, self.destination, domain, rf_channel))
+        await asyncio.sleep(settle)
+
+    async def set_time(self, zone, latitude, longitude):
+        """Set clock, daylight-saving table and rounded location, as the app does."""
+        now = dt.datetime.now(dt.UTC)
+        await self.send_telegram(time_info(now, zone, latitude, longitude, self.destination))
 
     async def read_output_raw(self, index):
         """Read one output datapoint of channel 1 and return its value bytes."""
